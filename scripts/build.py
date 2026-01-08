@@ -4,18 +4,25 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
 import argparse
+import os
 import pathlib
 import platform
+import re
+import shutil
 import subprocess
 import sys
+from datetime import datetime
+from datetime import timezone
 
 try:
     import argcomplete
 except:
     argcomplete = None
 
-MODEL_CONVERTER_DIR = pathlib.Path(__file__).resolve().parent / ".."
+MODEL_CONVERTER_DIR = pathlib.Path(__file__).parent / ".."
+MODEL_CONVERTER_DIR = MODEL_CONVERTER_DIR.resolve()
 DEPENDENCY_DIR = MODEL_CONVERTER_DIR / ".." / ".." / "dependencies"
+DEPENDENCY_DIR = DEPENDENCY_DIR.resolve()
 CMAKE_TOOLCHAIN_PATH = MODEL_CONVERTER_DIR / "cmake" / "toolchain"
 
 
@@ -30,33 +37,50 @@ class Builder:
     """
 
     def __init__(self, args):
-        self.build_dir = args.build_dir
+        self.build_dir = str(pathlib.Path(args.build_dir).resolve())
         self.threads = args.threads
         self.prefix_path = args.prefix_path
         self.external_llvm = args.external_llvm
         self.skip_llvm_patch = args.skip_llvm_patch
         self.run_tests = args.test
         self.build_type = args.build_type
-        self.flatc_path = args.flatc_path
         self.vgf_lib_path = args.vgf_lib_path
         self.json_path = args.json_path
         self.flatbuffers_path = args.flatbuffers_path
-        self.tosa_mlir_translator_path = args.tosa_mlir_translator_path
+        self.tosa_tools_path = args.tosa_tools_path
         self.argparse_path = args.argparse_path
         self.doc = args.doc
-        self.run_linting = args.lint
-        self.enable_gcc_sanitizers = args.enable_gcc_sanitizers
+        self.lint = args.lint
+        self.enable_sanitizers = args.enable_sanitizers
         self.install = args.install
-        self.package = args.package
-        self.package_type = args.package_type
         self.target_platform = args.target_platform
+        self.clang_tidy_fix = args.clang_tidy_fix
+
+        self.package_dir = args.package_dir or self.build_dir
+        self.package_tgz = "tgz" in args.package_type
+        self.package_zip = "zip" in args.package_type
+        self.package_pip = "pip" in args.package_type
+        self.package_release_pip = "release-pip" in args.package_type
+        self.package_version = args.package_version
+
+        if self.package_release_pip:
+            self.package_pip = True
+
+        if not self.install and self.package_pip:
+            self.install = "pip_install"
 
     def setup_platform_build(self, cmake_cmd):
+        system = platform.system()
         if self.target_platform == "host":
-            system = platform.system()
             if system == "Linux":
                 cmake_cmd.append(
-                    f"-DCMAKE_TOOLCHAIN_FILE={CMAKE_TOOLCHAIN_PATH / 'linux-gcc.cmake'}"
+                    f"-DCMAKE_TOOLCHAIN_FILE={CMAKE_TOOLCHAIN_PATH / 'gcc.cmake'}"
+                )
+                return True
+
+            if system == "Darwin":
+                cmake_cmd.append(
+                    f"-DCMAKE_TOOLCHAIN_FILE={CMAKE_TOOLCHAIN_PATH / 'clang.cmake'}"
                 )
                 return True
 
@@ -70,6 +94,18 @@ class Builder:
             print(f"Unsupported host platform {system}", file=sys.stderr)
             return False
 
+        if self.target_platform == "linux-clang":
+            if system != "Linux":
+                print(
+                    f"ERROR: target {self.target_platform} only supported on Linux. Host platform {system}",
+                    file=sys.stderr,
+                )
+                return False
+            cmake_cmd.append(
+                f"-DCMAKE_TOOLCHAIN_FILE={CMAKE_TOOLCHAIN_PATH / 'clang.cmake'}"
+            )
+            return True
+
         if self.target_platform == "aarch64":
             cmake_cmd.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={CMAKE_TOOLCHAIN_PATH / 'linux-aarch64-gcc.cmake'}"
@@ -82,7 +118,6 @@ class Builder:
 
             cmake_cmd.append("-DBUILD_WSI_WAYLAND_SUPPORT=OFF")
             cmake_cmd.append("-DBUILD_WSI_XLIB_SUPPORT=OFF")
-            cmake_cmd.append("-DBUILD_WSI_XLIB_SUPPORT=OFF")
             cmake_cmd.append("-DBUILD_WSI_XCB_SUPPORT=OFF")
             return True
 
@@ -92,6 +127,22 @@ class Builder:
         )
         return False
 
+    def generate_cmake_package(self, generator):
+        cmake_package_cmd = [
+            "cpack",
+            "--config",
+            f"{self.build_dir}/CPackConfig.cmake",
+            "-C",
+            self.build_type,
+            "-G",
+            generator,
+            "-B",
+            self.package_dir,
+            "-D",
+            "CPACK_INCLUDE_TOPLEVEL_DIRECTORY=OFF",
+        ]
+        subprocess.run(cmake_package_cmd, check=True)
+
     def run(self):
         cmake_setup_cmd = [
             "cmake",
@@ -100,6 +151,8 @@ class Builder:
             "-B",
             self.build_dir,
             f"-DCMAKE_BUILD_TYPE={self.build_type}",
+            "-G",
+            "Ninja",
         ]
 
         if self.prefix_path:
@@ -111,9 +164,6 @@ class Builder:
         if not self.setup_platform_build(cmake_setup_cmd):
             return 1
 
-        if self.flatc_path:
-            cmake_setup_cmd.append(f"-DFLATC_PATH={self.flatc_path}")
-
         if self.vgf_lib_path:
             cmake_setup_cmd.append(f"-DML_SDK_VGF_LIB_PATH={self.vgf_lib_path}")
 
@@ -123,21 +173,47 @@ class Builder:
         if self.flatbuffers_path:
             cmake_setup_cmd.append(f"-DFLATBUFFERS_PATH={self.flatbuffers_path}")
 
-        if self.tosa_mlir_translator_path:
-            cmake_setup_cmd.append(
-                f"-DTOSA_MLIR_TRANSLATOR_PATH={self.tosa_mlir_translator_path}"
-            )
+        if self.tosa_tools_path:
+            cmake_setup_cmd.append(f"-DTOSA_TOOLS_PATH={self.tosa_tools_path}")
 
         if self.argparse_path:
             cmake_setup_cmd.append(f"-DARGPARSE_PATH={self.argparse_path}")
 
-        if self.run_linting:
-            cmake_setup_cmd.append("-DMODEL_CONVERTER_ENABLE_LINT=ON")
+        if self.lint:
+            cmake_setup_cmd.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
         if self.doc:
             cmake_setup_cmd.append("-DMODEL_CONVERTER_BUILD_DOCS=ON")
 
-        if self.enable_gcc_sanitizers:
-            cmake_setup_cmd.append("-DMODEL_CONVERTER_GCC_SANITIZERS=ON")
+        if self.enable_sanitizers:
+            if self.target_platform != "host":
+                print(
+                    f"ERROR: sanitizer not supported for target platform: {self.target_platform}"
+                )
+                return 1
+
+            system = platform.system()
+            if system == "Linux":
+                gcc_sanitizer_flags = [
+                    "-g",
+                    "-fsanitize=undefined,address",
+                    "-fno-sanitize=vptr",
+                    "-fno-sanitize=alignment",
+                    "-fno-sanitize-recover=all",
+                ]
+                cmake_setup_cmd.append(
+                    f"-DCMAKE_CXX_FLAGS={' '.join(gcc_sanitizer_flags)}"
+                )
+                cmake_setup_cmd.append(
+                    "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=undefined,address"
+                )
+            elif system == "Windows":
+                cmake_setup_cmd.append("-DCMAKE_CXX_FLAGS=/fsanitize=address /Zi /MDd")
+                cmake_setup_cmd.append(
+                    "-DCMAKE_EXE_LINKER_FLAGS=/INFERASANLIBS /DEBUG /INCREMENTAL:NO"
+                )
+            else:
+                print(f"ERROR: sanitizer is not supported on system: {system}")
+
         if self.skip_llvm_patch:
             cmake_setup_cmd.append("-DMODEL_CONVERTER_APPLY_LLVM_PATCH=OFF")
 
@@ -155,20 +231,44 @@ class Builder:
             subprocess.run(cmake_setup_cmd, check=True)
             subprocess.run(cmake_build_cmd, check=True)
 
-            if self.run_tests:
-                pytest_cmd = [
-                    "python",
-                    "-m",
-                    "pytest",
-                    "test",
-                    "-n",
-                    str(self.threads),
-                    "--build-dir",
-                    self.build_dir,
-                    "--build-type",
-                    self.build_type,
+            if self.clang_tidy_fix and not self.lint:
+                print(
+                    "WARNING: --clang-tidy-fix requires --lint to be enabled, argument ignored."
+                )
+
+            if self.lint:
+                src_dirs = [
+                    f"{MODEL_CONVERTER_DIR / 'src'}",
                 ]
-                subprocess.run(pytest_cmd, cwd=MODEL_CONVERTER_DIR, check=True)
+
+                lint_cmd = [
+                    "cppcheck",
+                    f"-j{str(self.threads)}",
+                    "--std=c++17",
+                    "--error-exitcode=1",
+                    "--inline-suppr",
+                    f"--cppcheck-build-dir={self.build_dir}/cppcheck",
+                    "--enable=information,performance,portability,style",
+                    f"-i={DEPENDENCY_DIR}",
+                    f"--suppress=noValidConfiguration",
+                    f"--suppress=unassignedVariable",
+                    f"--suppress=unmatchedSuppression",
+                    f"--suppress=variableScope",
+                    f"--suppress=*:MachineIndependent*",
+                    f"--suppress=*:{DEPENDENCY_DIR}*",
+                ] + src_dirs
+                subprocess.run(lint_cmd, check=True)
+
+                clang_tidy_cmd = [
+                    "run-clang-tidy",
+                    f"-j{self.threads}",
+                    f"-p{self.build_dir}",
+                ] + src_dirs
+
+                if self.clang_tidy_fix:
+                    clang_tidy_cmd.append("-fix")
+
+                subprocess.run(clang_tidy_cmd, check=True)
 
             if self.install:
                 cmake_install_cmd = [
@@ -182,29 +282,77 @@ class Builder:
                 ]
                 subprocess.run(cmake_install_cmd, check=True)
 
-            if self.package:
-                package_type = self.package_type or "tgz"
-                cpack_generator = package_type.upper()
-
-                cmake_package_cmd = [
-                    "cpack",
-                    "--config",
-                    f"{self.build_dir}/CPackConfig.cmake",
-                    "-C",
-                    self.build_type,
-                    "-G",
-                    cpack_generator,
-                    "-B",
-                    self.package,
-                    "-D",
-                    "CPACK_INCLUDE_TOPLEVEL_DIRECTORY=OFF",
+            if self.run_tests:
+                pytest_cmd = [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "test",
+                    "-n",
+                    str(self.threads),
+                    "--build-dir",
+                    self.build_dir,
                 ]
-                subprocess.run(cmake_package_cmd, check=True)
+                if self.enable_sanitizers:
+                    pytest_cmd.append("--sanitizers")
+                subprocess.run(pytest_cmd, cwd=MODEL_CONVERTER_DIR, check=True)
+
+            if self.package_tgz:
+                self.generate_cmake_package("TGZ")
+
+            if self.package_zip:
+                self.generate_cmake_package("ZIP")
+
+            if self.package_pip:
+                os.makedirs("pip_package/model_converter/binaries/", exist_ok=True)
+                shutil.copytree(
+                    self.install,
+                    "pip_package/model_converter/binaries/",
+                    dirs_exist_ok=True,
+                )
+                shutil.copyfile("README.md", "pip_package/README.md")
+
+                package_version = ""
+                if self.package_version:
+                    package_version = self.package_version
+                else:
+                    package_version = (
+                        "" if self.package_release_pip else get_package_version()
+                    )
+
+                os.environ[
+                    "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AI_ML_SDK_MODEL_CONVERTER"
+                ] = package_version
+
+                result = subprocess.Popen(
+                    [sys.executable, "-m", "build"],
+                    env=os.environ,
+                    cwd="pip_package",
+                )
+                result.communicate()
+                if result.returncode != 0:
+                    print("ERROR: Failed to generate pip package")
+                    return 1
+
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"ModelConverterBuilder failed with {e}", file=sys.stderr)
             return 1
 
         return 0
+
+
+def get_package_version():
+    pyproject = (MODEL_CONVERTER_DIR / "pip_package" / "pyproject.toml").read_text()
+
+    regex_result = re.search(r'fallback_version\s*=\s*"([^"]+)"', pyproject)
+    if not regex_result:
+        raise RuntimeError("fallback_version not found")
+
+    base_version = regex_result.group(1)
+
+    date_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    return f"{base_version}.dev{date_tag}"
 
 
 def parse_arguments():
@@ -243,13 +391,8 @@ def parse_arguments():
         default="Release",
     )
     parser.add_argument(
-        "--flatc-path",
-        help="Path to the flatc compiler",
-        default="",
-    )
-    parser.add_argument(
         "--vgf-lib-path",
-        help="Path to the ml-sdk-vgf-lib repo",
+        help="Path to the ai-ml-sdk-vgf-library repo",
         default=f"{MODEL_CONVERTER_DIR / '..' / 'vgf-lib'}",
     )
     parser.add_argument(
@@ -268,9 +411,9 @@ def parse_arguments():
         default=f"{DEPENDENCY_DIR / 'json'}",
     )
     parser.add_argument(
-        "--tosa-mlir-translator-path",
-        help="Path to the TOSA MLIR Translator repo",
-        default=f"{DEPENDENCY_DIR / 'tosa_mlir_translator'}",
+        "--tosa-tools-path",
+        help="Path to the TOSA Tools repo",
+        default=f"{DEPENDENCY_DIR / 'tosa-tools'}",
     )
     parser.add_argument(
         "--doc",
@@ -279,8 +422,8 @@ def parse_arguments():
         default=False,
     )
     parser.add_argument(
-        "--enable-gcc-sanitizers",
-        help="Enable GCC sanitizers. Default: %(default)s",
+        "--enable-sanitizers",
+        help="Enable sanitizers. Default: %(default)s",
         action="store_true",
         default=False,
     )
@@ -302,19 +445,33 @@ def parse_arguments():
         help="Install build artifacts into a provided location",
     )
     parser.add_argument(
-        "--package",
-        help="Create a package with build artifacts and store it in a provided location",
+        "--package-dir",
+        help="Specify location for packages to be created. Default path is the build directory",
+        default="",
     )
     parser.add_argument(
         "--package-type",
-        choices=["zip", "tgz"],
-        help="Package type",
+        action="append",
+        choices=["zip", "tgz", "pip", "release-pip"],
+        help="Create a package of a certain type",
+        default=[],
+    )
+    parser.add_argument(
+        "--package-version",
+        help="Manually specify pip package version number",
+        default="",
     )
     parser.add_argument(
         "--target-platform",
         help="Specify the target build platform",
-        choices=["host", "aarch64"],
+        choices=["host", "aarch64", "linux-clang"],
         default="host",
+    )
+    parser.add_argument(
+        "--clang-tidy-fix",
+        help="Enable clang-tidy fix (requires --lint). Default: %(default)s",
+        action="store_true",
+        default=False,
     )
 
     if argcomplete:

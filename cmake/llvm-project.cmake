@@ -33,17 +33,27 @@ endfunction()
 
 if(EXISTS ${LLVM_PATH}/llvm/CMakeLists.txt)
     if(MODEL_CONVERTER_APPLY_LLVM_PATCH)
-        set(LLVM_PATCH_COMMIT_MESSAGE "llvm-changes-for-model-converter-29-07-2025")
+        set(LLVM_PATCH_COMMIT_MESSAGE "llvm-changes-for-model-converter-14-11-2025")
         execute_process(
             COMMAND git log --grep=${LLVM_PATCH_COMMIT_MESSAGE}
             WORKING_DIRECTORY "${LLVM_PATH}"
             RESULT_VARIABLE LLVM_PATCH_SEARCH_RESULT
             OUTPUT_VARIABLE LLVM_PATCH_SEARCH_OUTPUT
         )
+        set(LLVM_PROJECT_PATCH_FILE "${CMAKE_CURRENT_LIST_DIR}/../patches/llvm.patch")
         if(LLVM_PATCH_SEARCH_OUTPUT)
-            message(STATUS "LLVM patch is already applied")
+            # Check if the already applied patch matches the patch file
+            execute_process(
+                COMMAND git apply --reverse --check ${LLVM_PROJECT_PATCH_FILE}
+                WORKING_DIRECTORY ${LLVM_PATH}
+                RESULT_VARIABLE LLVM_PATCH_REVERSE_CHECK
+            )
+            if(LLVM_PATCH_REVERSE_CHECK EQUAL 0)
+                message(STATUS "LLVM patch is already applied")
+            else()
+                message(FATAL_ERROR "Existing LLVM commit ${LLVM_PATCH_COMMIT_MESSAGE} doesnt match LLVM patch file")
+            endif()
         else()
-            set(LLVM_PROJECT_PATCH_FILE "${CMAKE_CURRENT_LIST_DIR}/../patches/llvm.patch")
             execute_process(
                 COMMAND git -c user.name=svc_sdk -c user.email=svc_sdk@arm.com am "${LLVM_PROJECT_PATCH_FILE}"
                 WORKING_DIRECTORY "${LLVM_PATH}"
@@ -83,7 +93,7 @@ if(EXISTS ${LLVM_PATH}/llvm/CMakeLists.txt)
         # which clashes with the glslang SPIRV target
         if(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "^(x86|x86_64|AMD64|x64)$")
             set(TARGETS_TO_BUILD "X86")
-        elseif(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "^arm64")
+        elseif(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "^(aarch64|arm64)$")
             set(TARGETS_TO_BUILD "AArch64")
         endif()
 

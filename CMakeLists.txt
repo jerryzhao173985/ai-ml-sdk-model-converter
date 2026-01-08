@@ -38,24 +38,22 @@ endif()
 option(MODEL_CONVERTER_ENABLE_CCACHE "Enable CCACHE support" OFF)
 option(MODEL_CONVERTER_BUILD_DOCS "Build documentation" OFF)
 option(MODEL_CONVERTER_ENABLE_COVERAGE "Enable coverage build" OFF)
-option(MODEL_CONVERTER_ENABLE_LINT "Enable linting using cppcheck" OFF)
 option(MODEL_CONVERTER_ENABLE_LTO "Enable Link Time Optimization when CMAKE_BUILD_TYPE=Release" ON)
-option(MODEL_CONVERTER_GCC_SANITIZERS "Sanitizers" OFF)
 set(MODEL_CONVERTER_LOG_TRACE_MASK "" CACHE STRING "Log trace enable mask")
 
 set(MODEL_CONVERTER_PACKAGE_NAME ${PROJECT_NAME})
 set(MODEL_CONVERTER_NAMESPACE ${PROJECT_NAME})
-if(ML_SDK_GENERATE_CPACK)
-    set(MODEL_CONVERTER_PACKAGE_NAME "ml-sdk")
+if(NOT (CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR) AND ML_SDK_GENERATE_CPACK)
+    set(MODEL_CONVERTER_PACKAGE_NAME "ai_ml_sdk_for_vulkan")
 else()
-    set(CPACK_PACKAGE_NAME "ml-sdk-model-converter")
+    set(CPACK_PACKAGE_NAME "ai_ml_sdk_model_converter")
 endif()
 
 #########################################################################################
 # Third Party Dependency path resolver
 #########################################################################################
 
-set(TOSA_MLIR_TRANSLATOR_PATH "TOSA_MLIR_TRANSLATOR-NOTFOUND" CACHE PATH "Path to TOSA MLIR Translator")
+set(TOSA_TOOLS_PATH "TOSA_TOOLS-NOTFOUND" CACHE PATH "Path to TOSA Tools")
 
 #############################################################################
 # Toolchain configuration
@@ -75,7 +73,7 @@ include(flatbuffers)
 include(vgf-lib)
 include(llvm-project)
 include(version)
-include(tosa_mlir_translator)
+include(tosa_tools)
 
 set(DEFAULT_CMAKE_BUILD_TYPE "Debug")
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -102,54 +100,6 @@ endif()
 #############################################################################
 # Top level targets, Table Gen Dialect Libraries
 #############################################################################
-
-# Enable cppcheck
-if(MODEL_CONVERTER_ENABLE_LINT)
-    message(STATUS "Cppcheck is enabled.")
-    find_program(CPPCHECK_EXECUTABLE NAMES cppcheck)
-    include(ProcessorCount)
-    ProcessorCount(NCORES)
-    set(CMAKE_CXX_CPPCHECK_OPTIONS
-        -j${NCORES}
-        --std=c++17
-        --enable=style,performance,portability,information
-        --quiet
-        --inline-suppr
-        --error-exitcode=1
-        --suppress=unreadVariable
-        --suppress=unmatchedSuppression
-        --suppress=noValidConfiguration
-        --suppress=variableScope
-        --suppress=*:${CMAKE_BINARY_DIR}*
-        )
-
-    if(EXISTS ${CMAKE_PREFIX_PATH})
-        list(APPEND CMAKE_CXX_CPPCHECK_OPTIONS --suppress=*:*${CMAKE_PREFIX_PATH}*)
-    endif()
-
-    if(EXISTS ${LLVM_PATH})
-        list(APPEND CMAKE_CXX_CPPCHECK_OPTIONS --suppress=*:*${LLVM_PATH}*)
-    endif()
-
-    if(EXISTS ${ML_SDK_VGF_LIB_PATH})
-        list(APPEND CMAKE_CXX_CPPCHECK_OPTIONS --suppress=*:*${ML_SDK_VGF_LIB_PATH}*)
-    endif()
-
-    if(EXISTS ${TOSA_MLIR_TRANSLATOR_PATH})
-        list(APPEND CMAKE_CXX_CPPCHECK_OPTIONS --suppress=*:*${TOSA_MLIR_TRANSLATOR_PATH}*)
-    endif()
-
-    if(EXISTS ${FLATBUFFERS_PATH})
-        list(APPEND CMAKE_CXX_CPPCHECK_OPTIONS --suppress=*:*${FLATBUFFERS_PATH}*)
-    endif()
-
-    if(EXISTS ${ARGPARSE_PATH})
-        list(APPEND CMAKE_CXX_CPPCHECK_OPTIONS --suppress=*:*${ARGPARSE_PATH}*)
-    endif()
-
-    set(CMAKE_CXX_CPPCHECK "${CPPCHECK_EXECUTABLE}" "${CMAKE_CXX_CPPCHECK_OPTIONS}")
-endif()
-unset(MODEL_CONVERTER_ENABLE_LINT CACHE)
 
 set(LLVM_TARGET_DEFINITIONS src/include/passes.td)
 mlir_tablegen(passes.hpp.inc -gen-pass-decls)
@@ -246,9 +196,9 @@ add_custom_target(model-converter-tests ALL DEPENDS VGF::vgf_dump)
 ###############################################################################
 # Packaging
 ###############################################################################
-include(package)
 
-if(NOT ML_SDK_GENERATE_CPACK)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    include(cmake/package.cmake)
     mlsdk_package(PACKAGE_NAME ${MODEL_CONVERTER_PACKAGE_NAME}
         NAMESPACE ${MODEL_CONVERTER_NAMESPACE}
         LICENSES "${CMAKE_CURRENT_LIST_DIR}/LICENSES/Apache-2.0.txt"
